@@ -311,11 +311,21 @@ public actor SlidingWindowStreamingManager {
                 "\(String(format: "%.3f", lastTranscriptionDuration))s (RTF: \(String(format: "%.3f", rtf)))"
             )
 
+            // Get raw text from this chunk BEFORE merging
+            let rawChunkText = asrManager.processTranscriptionResult(
+                tokenIds: tokenWindows.map { $0.token },
+                timestamps: tokenWindows.map { $0.timestamp },
+                confidences: tokenWindows.map { $0.confidence },
+                encoderSequenceLength: 0,
+                audioSamples: [],
+                processingTime: lastTranscriptionDuration
+            ).text
+
             // Merge with confirmed tokens
             await mergeTokens(tokenWindows, windowStartSample: absoluteStartSample)
 
-            // Emit update
-            await emitUpdate(isFinal: isFinal)
+            // Emit update with raw chunk text
+            await emitUpdate(isFinal: isFinal, latestChunkText: rawChunkText)
 
         } catch {
             logger.error("Window processing failed: \(error.localizedDescription)")
@@ -351,10 +361,10 @@ public actor SlidingWindowStreamingManager {
     }
 
     /// Emit transcription update with metrics
-    private func emitUpdate(isFinal: Bool) async {
+    private func emitUpdate(isFinal: Bool, latestChunkText: String = "") async {
         guard let asrManager = asrManager else { return }
 
-        // Convert tokens to text
+        // Convert tokens to text (merged/accumulated)
         let result = asrManager.processTranscriptionResult(
             tokenIds: confirmedTokens.map { $0.token },
             timestamps: confirmedTokens.map { $0.timestamp },
@@ -368,6 +378,7 @@ public actor SlidingWindowStreamingManager {
 
         let update = SlidingWindowTranscriptionUpdate(
             text: result.text,
+            latestChunkText: latestChunkText,
             isFinal: isFinal,
             confidence: result.confidence,
             timestamp: Date(),
@@ -529,8 +540,11 @@ public struct TranscriptionMetrics: Sendable {
 
 /// Transcription update from sliding window streaming
 public struct SlidingWindowTranscriptionUpdate: Sendable {
-    /// Current transcription text
+    /// Current transcription text (merged/accumulated)
     public let text: String
+
+    /// Raw text from the latest chunk BEFORE merging (for debugging)
+    public let latestChunkText: String
 
     /// Whether this is the final update (stream ended)
     public let isFinal: Bool
@@ -549,6 +563,7 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
 
     public init(
         text: String,
+        latestChunkText: String,
         isFinal: Bool,
         confidence: Float,
         timestamp: Date,
@@ -556,6 +571,7 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
         metrics: TranscriptionMetrics
     ) {
         self.text = text
+        self.latestChunkText = latestChunkText
         self.isFinal = isFinal
         self.confidence = confidence
         self.timestamp = timestamp
