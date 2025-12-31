@@ -351,6 +351,17 @@ public actor SlidingWindowStreamingManager {
                 processingTime: lastTranscriptionDuration
             )
 
+            // Build window token data if debug mode is enabled
+            var windowData: TranscriptionWindowData?
+            if config.emitWindowData {
+                windowData = buildWindowTokenData(
+                    tokenWindows: tokenWindows,
+                    windowStartSample: absoluteStartSample,
+                    windowDurationSamples: samples.count,
+                    asrManager: asrManager
+                )
+            }
+
             // Merge with confirmed tokens
             await mergeTokens(tokenWindows, windowStartSample: absoluteStartSample)
 
@@ -359,8 +370,13 @@ public actor SlidingWindowStreamingManager {
                 await updateTranscriptionState(with: chunkResult)
             }
 
-            // Emit update with raw chunk text
-            await emitUpdate(isFinal: isFinal, latestChunkText: chunkResult.text, chunkConfidence: chunkResult.confidence)
+            // Emit update with raw chunk text and optional window data
+            await emitUpdate(
+                isFinal: isFinal,
+                latestChunkText: chunkResult.text,
+                chunkConfidence: chunkResult.confidence,
+                windowData: windowData
+            )
 
         } catch {
             logger.error("Window processing failed: \(error.localizedDescription)")
@@ -460,8 +476,63 @@ public actor SlidingWindowStreamingManager {
         confirmedTokens.sort { $0.timestamp < $1.timestamp }
     }
 
+    /// Build window token data for visualization
+    private func buildWindowTokenData(
+        tokenWindows: [TokenWindow],
+        windowStartSample: Int,
+        windowDurationSamples: Int,
+        asrManager: AsrManager
+    ) -> TranscriptionWindowData {
+        let windowStartMs = (windowStartSample * 1000) / SlidingWindowStreamingConfig.sampleRate
+        let windowDurationMs = (windowDurationSamples * 1000) / SlidingWindowStreamingConfig.sampleRate
+        let edgeBufferMs = config.edgeBufferMs
+
+        // Convert tokens to WindowToken format with edge buffer detection
+        let tokens: [WindowToken] = tokenWindows.map { tw in
+            // Convert frame timestamp to milliseconds
+            // Frames are at ~80 frames per second (1280 samples per frame at 16kHz)
+            let frameMs = (tw.timestamp * 1000 * ASRConstants.samplesPerEncoderFrame) / SlidingWindowStreamingConfig.sampleRate
+            let timestampMs = windowStartMs + frameMs
+            let positionInWindowMs = frameMs
+
+            // Determine if token is in edge buffer zones
+            let isInStartBuffer = positionInWindowMs < edgeBufferMs
+            let isInEndBuffer = positionInWindowMs > (windowDurationMs - edgeBufferMs)
+
+            // Decode token text
+            let tokenText = asrManager.decodeToken(tw.token)
+
+            return WindowToken(
+                tokenId: tw.token,
+                text: tokenText,
+                confidence: tw.confidence,
+                timestampMs: timestampMs,
+                positionInWindowMs: positionInWindowMs,
+                isInStartBuffer: isInStartBuffer,
+                isInEndBuffer: isInEndBuffer
+            )
+        }
+
+        // Calculate average confidence
+        let avgConfidence: Float = tokens.isEmpty ? 0 : tokens.map(\.confidence).reduce(0, +) / Float(tokens.count)
+
+        return TranscriptionWindowData(
+            windowIndex: chunkCount - 1,  // 0-based index
+            windowStartMs: windowStartMs,
+            durationMs: windowDurationMs,
+            bufferDurationMs: edgeBufferMs,
+            tokens: tokens,
+            averageConfidence: avgConfidence
+        )
+    }
+
     /// Emit transcription update with metrics
-    private func emitUpdate(isFinal: Bool, latestChunkText: String = "", chunkConfidence: Float = 0) async {
+    private func emitUpdate(
+        isFinal: Bool,
+        latestChunkText: String = "",
+        chunkConfidence: Float = 0,
+        windowData: TranscriptionWindowData? = nil
+    ) async {
         guard let asrManager = asrManager else { return }
 
         // Convert tokens to text (merged/accumulated)
@@ -492,7 +563,8 @@ public actor SlidingWindowStreamingManager {
             confidence: result.confidence,
             timestamp: Date(),
             tokenTimings: result.tokenTimings ?? [],
-            metrics: metrics
+            metrics: metrics,
+            windowData: windowData
         )
 
         updateContinuation?.yield(update)
@@ -560,6 +632,16 @@ public struct SlidingWindowStreamingConfig: Sendable {
     /// Minimum audio duration before confirming text (seconds)
     public let minContextForConfirmation: TimeInterval
 
+    // MARK: - Debug/Visualization Options
+
+    /// Whether to emit detailed window token data for visualization (default: false)
+    /// When enabled, each update includes full token-level data for the current window.
+    public let emitWindowData: Bool
+
+    /// Size of the "edge distrust" buffer zones at start/end of each window (seconds)
+    /// Tokens within this buffer are marked as lower trust.
+    public let edgeBufferSeconds: TimeInterval
+
     /// Default configuration optimized for quality
     public static let `default` = SlidingWindowStreamingConfig(
         intervalSeconds: 2.0,
@@ -570,7 +652,9 @@ public struct SlidingWindowStreamingConfig: Sendable {
         preserveDecoderState: false,
         useConfirmationModel: true,
         confirmationThreshold: 0.85,
-        minContextForConfirmation: 10.0
+        minContextForConfirmation: 10.0,
+        emitWindowData: false,
+        edgeBufferSeconds: 1.0
     )
 
     /// Low-latency configuration for faster updates
@@ -583,7 +667,9 @@ public struct SlidingWindowStreamingConfig: Sendable {
         preserveDecoderState: false,
         useConfirmationModel: true,
         confirmationThreshold: 0.80,
-        minContextForConfirmation: 5.0
+        minContextForConfirmation: 5.0,
+        emitWindowData: false,
+        edgeBufferSeconds: 0.5
     )
 
     /// High quality configuration with longer context
@@ -596,7 +682,9 @@ public struct SlidingWindowStreamingConfig: Sendable {
         preserveDecoderState: false,
         useConfirmationModel: true,
         confirmationThreshold: 0.90,
-        minContextForConfirmation: 15.0
+        minContextForConfirmation: 15.0,
+        emitWindowData: false,
+        edgeBufferSeconds: 1.5
     )
 
     /// Stateful configuration - preserves decoder state for linguistic continuity
@@ -609,7 +697,24 @@ public struct SlidingWindowStreamingConfig: Sendable {
         preserveDecoderState: true,
         useConfirmationModel: true,
         confirmationThreshold: 0.85,
-        minContextForConfirmation: 10.0
+        minContextForConfirmation: 10.0,
+        emitWindowData: false,
+        edgeBufferSeconds: 1.0
+    )
+
+    /// Debug configuration - emits detailed window data for visualization
+    public static let debug = SlidingWindowStreamingConfig(
+        intervalSeconds: 2.0,
+        contextWindowSeconds: 14.0,
+        overlapSeconds: 2.0,
+        minInitialSeconds: 2.0,
+        maxBufferSeconds: 30.0,
+        preserveDecoderState: false,
+        useConfirmationModel: true,
+        confirmationThreshold: 0.85,
+        minContextForConfirmation: 10.0,
+        emitWindowData: true,
+        edgeBufferSeconds: 1.0
     )
 
     public init(
@@ -621,7 +726,9 @@ public struct SlidingWindowStreamingConfig: Sendable {
         preserveDecoderState: Bool = false,
         useConfirmationModel: Bool = true,
         confirmationThreshold: Double = 0.85,
-        minContextForConfirmation: TimeInterval = 10.0
+        minContextForConfirmation: TimeInterval = 10.0,
+        emitWindowData: Bool = false,
+        edgeBufferSeconds: TimeInterval = 1.0
     ) {
         self.intervalSeconds = intervalSeconds
         self.contextWindowSeconds = contextWindowSeconds
@@ -632,6 +739,8 @@ public struct SlidingWindowStreamingConfig: Sendable {
         self.useConfirmationModel = useConfirmationModel
         self.confirmationThreshold = confirmationThreshold
         self.minContextForConfirmation = minContextForConfirmation
+        self.emitWindowData = emitWindowData
+        self.edgeBufferSeconds = edgeBufferSeconds
     }
 
     // Sample counts at 16kHz
@@ -640,6 +749,54 @@ public struct SlidingWindowStreamingConfig: Sendable {
     var minInitialSamples: Int { Int(minInitialSeconds * Double(Self.sampleRate)) }
     var maxBufferSamples: Int { Int(maxBufferSeconds * Double(Self.sampleRate)) }
     var minContextForConfirmationSamples: Int { Int(minContextForConfirmation * Double(Self.sampleRate)) }
+    var edgeBufferMs: Int { Int(edgeBufferSeconds * 1000) }
+}
+
+// MARK: - Window Token Data (for visualization)
+
+/// A single token with metadata for visualization
+public struct WindowToken: Sendable {
+    /// The raw token ID from the model
+    public let tokenId: Int
+
+    /// The decoded text for this token
+    public let text: String
+
+    /// Confidence score for this token (0.0 - 1.0)
+    public let confidence: Float
+
+    /// Position in the full recording (milliseconds)
+    public let timestampMs: Int
+
+    /// Position within the window (milliseconds from window start)
+    public let positionInWindowMs: Int
+
+    /// Whether this token is in the START edge buffer zone
+    public let isInStartBuffer: Bool
+
+    /// Whether this token is in the END edge buffer zone
+    public let isInEndBuffer: Bool
+}
+
+/// Data for a single transcription window
+public struct TranscriptionWindowData: Sendable {
+    /// Sequential index of this window (0-based)
+    public let windowIndex: Int
+
+    /// Start time of this window relative to recording start (milliseconds)
+    public let windowStartMs: Int
+
+    /// Total duration of this window (milliseconds)
+    public let durationMs: Int
+
+    /// Size of the edge distrust buffer (milliseconds)
+    public let bufferDurationMs: Int
+
+    /// All tokens in this window
+    public let tokens: [WindowToken]
+
+    /// Average confidence across all tokens
+    public let averageConfidence: Float
 }
 
 // MARK: - Metrics
@@ -731,6 +888,9 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
     /// Performance metrics for this update
     public let metrics: TranscriptionMetrics
 
+    /// Detailed window token data for visualization (only when emitWindowData is enabled)
+    public let windowData: TranscriptionWindowData?
+
     public init(
         text: String,
         volatileTranscript: String = "",
@@ -741,7 +901,8 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
         confidence: Float,
         timestamp: Date,
         tokenTimings: [TokenTiming],
-        metrics: TranscriptionMetrics
+        metrics: TranscriptionMetrics,
+        windowData: TranscriptionWindowData? = nil
     ) {
         self.text = text
         self.volatileTranscript = volatileTranscript
@@ -753,5 +914,6 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
         self.timestamp = timestamp
         self.tokenTimings = tokenTimings
         self.metrics = metrics
+        self.windowData = windowData
     }
 }

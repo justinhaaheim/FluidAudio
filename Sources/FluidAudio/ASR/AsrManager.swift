@@ -351,6 +351,13 @@ public final class AsrManager {
         token.replacingOccurrences(of: "▁", with: " ")
     }
 
+    /// Decode a single token ID to its text representation
+    /// Uses SentencePiece conventions (▁ represents space)
+    public func decodeToken(_ tokenId: Int) -> String {
+        guard let token = vocabulary[tokenId] else { return "" }
+        return token.replacingOccurrences(of: "▁", with: " ")
+    }
+
     internal func convertTokensWithExistingTimings(
         _ tokenIds: [Int], timings: [TokenTiming]
     ) -> (
