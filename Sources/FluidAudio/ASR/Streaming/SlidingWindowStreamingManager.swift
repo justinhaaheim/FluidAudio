@@ -33,6 +33,9 @@ public actor SlidingWindowStreamingManager {
     private var asrManager: AsrManager?
     private var audioSource: AudioSource = .microphone
 
+    // Decoder state (only used when preserveDecoderState is true)
+    private var decoderState: TdtDecoderState?
+
     // Input stream
     private let inputSequence: AsyncStream<AVAudioPCMBuffer>
     private let inputBuilder: AsyncStream<AVAudioPCMBuffer>.Continuation
@@ -45,6 +48,10 @@ public actor SlidingWindowStreamingManager {
     private var transcriptionTimerTask: Task<Void, Never>?
     private var isTranscribing: Bool = false
     private var isRunning: Bool = false
+
+    // Two-tier transcription state (like Apple's Speech API)
+    public private(set) var volatileTranscript: String = ""
+    public private(set) var confirmedTranscript: String = ""
 
     // Metrics tracking
     private var startTime: Date?
@@ -98,6 +105,18 @@ public actor SlidingWindowStreamingManager {
         lastTranscriptionDuration = 0
         lastAudioDuration = 0
         startTime = Date()
+
+        // Reset transcript state
+        volatileTranscript = ""
+        confirmedTranscript = ""
+
+        // Initialize decoder state if preserving
+        if config.preserveDecoderState {
+            decoderState = TdtDecoderState.make()
+            logger.info("Initialized persistent decoder state")
+        } else {
+            decoderState = nil
+        }
 
         // Start audio receive task
         audioReceiveTask = Task {
@@ -274,8 +293,13 @@ public actor SlidingWindowStreamingManager {
         chunkCount += 1
 
         do {
-            // Create a fresh decoder state (stateless, like batch)
-            var decoderState = TdtDecoderState.make()
+            // Use preserved decoder state or create fresh one
+            var workingDecoderState: TdtDecoderState
+            if config.preserveDecoderState, let existingState = decoderState {
+                workingDecoderState = existingState
+            } else {
+                workingDecoderState = TdtDecoderState.make()
+            }
 
             // Pad audio to model input size
             let paddedSamples = asrManager.padAudioIfNeeded(samples, targetLength: 240_000)
@@ -287,11 +311,16 @@ public actor SlidingWindowStreamingManager {
                 paddedSamples,
                 originalLength: samples.count,
                 actualAudioFrames: actualFrameCount,
-                decoderState: &decoderState,
+                decoderState: &workingDecoderState,
                 contextFrameAdjustment: 0,
                 isLastChunk: isFinal,
                 globalFrameOffset: globalFrameOffset
             )
+
+            // Save decoder state if preserving
+            if config.preserveDecoderState {
+                decoderState = workingDecoderState
+            }
 
             // Convert to TokenWindow format
             let tokenWindows: [TokenWindow] = zip(
@@ -308,27 +337,98 @@ public actor SlidingWindowStreamingManager {
             logger.debug(
                 "Window \(self.chunkCount): \(tokenWindows.count) tokens, " +
                 "\(String(format: "%.2f", lastAudioDuration))s audio in " +
-                "\(String(format: "%.3f", lastTranscriptionDuration))s (RTF: \(String(format: "%.3f", rtf)))"
+                "\(String(format: "%.3f", lastTranscriptionDuration))s (RTF: \(String(format: "%.3f", rtf)))" +
+                (config.preserveDecoderState ? " [stateful]" : " [stateless]")
             )
 
             // Get raw text from this chunk BEFORE merging
-            let rawChunkText = asrManager.processTranscriptionResult(
+            let chunkResult = asrManager.processTranscriptionResult(
                 tokenIds: tokenWindows.map { $0.token },
                 timestamps: tokenWindows.map { $0.timestamp },
                 confidences: tokenWindows.map { $0.confidence },
                 encoderSequenceLength: 0,
                 audioSamples: [],
                 processingTime: lastTranscriptionDuration
-            ).text
+            )
 
             // Merge with confirmed tokens
             await mergeTokens(tokenWindows, windowStartSample: absoluteStartSample)
 
+            // Update volatile/confirmed state if using confirmation model
+            if config.useConfirmationModel {
+                await updateTranscriptionState(with: chunkResult)
+            }
+
             // Emit update with raw chunk text
-            await emitUpdate(isFinal: isFinal, latestChunkText: rawChunkText)
+            await emitUpdate(isFinal: isFinal, latestChunkText: chunkResult.text, chunkConfidence: chunkResult.confidence)
 
         } catch {
             logger.error("Window processing failed: \(error.localizedDescription)")
+            await attemptErrorRecovery(error: error)
+        }
+    }
+
+    /// Update transcription state based on confidence and context duration
+    private func updateTranscriptionState(with result: ASRResult) async {
+        let totalAudioProcessed = Double(totalSamplesReceived) / Double(SlidingWindowStreamingConfig.sampleRate)
+        let hasMinimumContext = totalAudioProcessed >= config.minContextForConfirmation
+        let isHighConfidence = Double(result.confidence) >= config.confirmationThreshold
+
+        // Progressive confidence model:
+        // 1. Always show text immediately as volatile for responsiveness
+        // 2. Only confirm text when we have both high confidence AND sufficient context
+        let shouldConfirm = isHighConfidence && hasMinimumContext
+
+        if shouldConfirm {
+            // Move volatile text to confirmed and set new text as volatile
+            if !volatileTranscript.isEmpty {
+                var components: [String] = []
+                if !confirmedTranscript.isEmpty {
+                    components.append(confirmedTranscript)
+                }
+                components.append(volatileTranscript)
+                confirmedTranscript = components.joined(separator: " ")
+            }
+            volatileTranscript = result.text
+            logger.debug(
+                "CONFIRMED (\(result.confidence), \(String(format: "%.1f", totalAudioProcessed))s context): " +
+                "promoted to confirmed; new volatile '\(result.text.prefix(30))...'"
+            )
+        } else {
+            // Only update volatile text (hypothesis)
+            volatileTranscript = result.text
+            let reason = !hasMinimumContext
+                ? "insufficient context (\(String(format: "%.1f", totalAudioProcessed))s)"
+                : "low confidence (\(String(format: "%.2f", result.confidence)))"
+            logger.debug("VOLATILE: \(reason) - '\(result.text.prefix(30))...'")
+        }
+    }
+
+    // MARK: - Error Recovery
+
+    /// Attempt to recover from processing errors
+    private func attemptErrorRecovery(error: Error) async {
+        logger.warning("Attempting error recovery for: \(error)")
+
+        // Reset decoder state if we're preserving it
+        if config.preserveDecoderState {
+            await resetDecoderForRecovery()
+        }
+    }
+
+    /// Reset decoder state for error recovery
+    private func resetDecoderForRecovery() async {
+        if config.preserveDecoderState {
+            decoderState = TdtDecoderState.make()
+            logger.info("Reset decoder state during error recovery")
+        }
+    }
+
+    /// Manually reset decoder state (can be called from outside)
+    public func resetDecoderState() async {
+        if config.preserveDecoderState {
+            decoderState = TdtDecoderState.make()
+            logger.info("Manually reset decoder state")
         }
     }
 
@@ -361,7 +461,7 @@ public actor SlidingWindowStreamingManager {
     }
 
     /// Emit transcription update with metrics
-    private func emitUpdate(isFinal: Bool, latestChunkText: String = "") async {
+    private func emitUpdate(isFinal: Bool, latestChunkText: String = "", chunkConfidence: Float = 0) async {
         guard let asrManager = asrManager else { return }
 
         // Convert tokens to text (merged/accumulated)
@@ -376,8 +476,17 @@ public actor SlidingWindowStreamingManager {
 
         let metrics = getMetrics()
 
+        // Determine if this chunk should be marked as confirmed
+        let totalAudioProcessed = Double(totalSamplesReceived) / Double(SlidingWindowStreamingConfig.sampleRate)
+        let hasMinimumContext = totalAudioProcessed >= config.minContextForConfirmation
+        let isHighConfidence = Double(chunkConfidence) >= config.confirmationThreshold
+        let isConfirmed = config.useConfirmationModel && isHighConfidence && hasMinimumContext
+
         let update = SlidingWindowTranscriptionUpdate(
             text: result.text,
+            volatileTranscript: volatileTranscript,
+            confirmedTranscript: confirmedTranscript,
+            isConfirmed: isConfirmed,
             latestChunkText: latestChunkText,
             isFinal: isFinal,
             confidence: result.confidence,
@@ -433,13 +542,35 @@ public struct SlidingWindowStreamingConfig: Sendable {
     /// Max buffer size in memory
     public let maxBufferSeconds: TimeInterval
 
+    // MARK: - Decoder State Options
+
+    /// Whether to preserve decoder state between windows (default: false)
+    /// When true, LSTM state carries forward providing linguistic continuity.
+    /// When false, each window starts with fresh decoder state (stateless).
+    public let preserveDecoderState: Bool
+
+    // MARK: - Confirmation Options
+
+    /// Whether to use two-tier volatile/confirmed transcript model (default: true)
+    public let useConfirmationModel: Bool
+
+    /// Confidence threshold for promoting volatile text to confirmed (0.0...1.0)
+    public let confirmationThreshold: Double
+
+    /// Minimum audio duration before confirming text (seconds)
+    public let minContextForConfirmation: TimeInterval
+
     /// Default configuration optimized for quality
     public static let `default` = SlidingWindowStreamingConfig(
         intervalSeconds: 2.0,
         contextWindowSeconds: 14.0,
         overlapSeconds: 2.0,
         minInitialSeconds: 2.0,
-        maxBufferSeconds: 30.0
+        maxBufferSeconds: 30.0,
+        preserveDecoderState: false,
+        useConfirmationModel: true,
+        confirmationThreshold: 0.85,
+        minContextForConfirmation: 10.0
     )
 
     /// Low-latency configuration for faster updates
@@ -448,7 +579,11 @@ public struct SlidingWindowStreamingConfig: Sendable {
         contextWindowSeconds: 6.0,
         overlapSeconds: 1.0,
         minInitialSeconds: 1.0,
-        maxBufferSeconds: 20.0
+        maxBufferSeconds: 20.0,
+        preserveDecoderState: false,
+        useConfirmationModel: true,
+        confirmationThreshold: 0.80,
+        minContextForConfirmation: 5.0
     )
 
     /// High quality configuration with longer context
@@ -457,7 +592,24 @@ public struct SlidingWindowStreamingConfig: Sendable {
         contextWindowSeconds: 14.0,
         overlapSeconds: 3.0,
         minInitialSeconds: 3.0,
-        maxBufferSeconds: 45.0
+        maxBufferSeconds: 45.0,
+        preserveDecoderState: false,
+        useConfirmationModel: true,
+        confirmationThreshold: 0.90,
+        minContextForConfirmation: 15.0
+    )
+
+    /// Stateful configuration - preserves decoder state for linguistic continuity
+    public static let stateful = SlidingWindowStreamingConfig(
+        intervalSeconds: 2.0,
+        contextWindowSeconds: 14.0,
+        overlapSeconds: 2.0,
+        minInitialSeconds: 2.0,
+        maxBufferSeconds: 30.0,
+        preserveDecoderState: true,
+        useConfirmationModel: true,
+        confirmationThreshold: 0.85,
+        minContextForConfirmation: 10.0
     )
 
     public init(
@@ -465,13 +617,21 @@ public struct SlidingWindowStreamingConfig: Sendable {
         contextWindowSeconds: TimeInterval = 14.0,
         overlapSeconds: TimeInterval = 2.0,
         minInitialSeconds: TimeInterval = 2.0,
-        maxBufferSeconds: TimeInterval = 30.0
+        maxBufferSeconds: TimeInterval = 30.0,
+        preserveDecoderState: Bool = false,
+        useConfirmationModel: Bool = true,
+        confirmationThreshold: Double = 0.85,
+        minContextForConfirmation: TimeInterval = 10.0
     ) {
         self.intervalSeconds = intervalSeconds
         self.contextWindowSeconds = contextWindowSeconds
         self.overlapSeconds = overlapSeconds
         self.minInitialSeconds = minInitialSeconds
         self.maxBufferSeconds = maxBufferSeconds
+        self.preserveDecoderState = preserveDecoderState
+        self.useConfirmationModel = useConfirmationModel
+        self.confirmationThreshold = confirmationThreshold
+        self.minContextForConfirmation = minContextForConfirmation
     }
 
     // Sample counts at 16kHz
@@ -479,6 +639,7 @@ public struct SlidingWindowStreamingConfig: Sendable {
     var overlapSamples: Int { Int(overlapSeconds * Double(Self.sampleRate)) }
     var minInitialSamples: Int { Int(minInitialSeconds * Double(Self.sampleRate)) }
     var maxBufferSamples: Int { Int(maxBufferSeconds * Double(Self.sampleRate)) }
+    var minContextForConfirmationSamples: Int { Int(minContextForConfirmation * Double(Self.sampleRate)) }
 }
 
 // MARK: - Metrics
@@ -543,6 +704,15 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
     /// Current transcription text (merged/accumulated)
     public let text: String
 
+    /// Current volatile (unconfirmed) transcript - may change with future updates
+    public let volatileTranscript: String
+
+    /// Confirmed transcript - high-confidence text that won't change
+    public let confirmedTranscript: String
+
+    /// Whether the current update has been confirmed (high confidence + sufficient context)
+    public let isConfirmed: Bool
+
     /// Raw text from the latest chunk BEFORE merging (for debugging)
     public let latestChunkText: String
 
@@ -563,6 +733,9 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
 
     public init(
         text: String,
+        volatileTranscript: String = "",
+        confirmedTranscript: String = "",
+        isConfirmed: Bool = false,
         latestChunkText: String,
         isFinal: Bool,
         confidence: Float,
@@ -571,6 +744,9 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
         metrics: TranscriptionMetrics
     ) {
         self.text = text
+        self.volatileTranscript = volatileTranscript
+        self.confirmedTranscript = confirmedTranscript
+        self.isConfirmed = isConfirmed
         self.latestChunkText = latestChunkText
         self.isFinal = isFinal
         self.confidence = confidence
