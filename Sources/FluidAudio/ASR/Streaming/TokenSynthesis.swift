@@ -314,8 +314,45 @@ public final class WindowHistory: @unchecked Sendable {
 /// This is a PURE function - no side effects
 public func synthesizeTokens(context: SynthesisContext) -> SynthesisResult {
     guard !context.windows.isEmpty else {
-        return SynthesisResult(tokens: [], newlyConfirmed: [])
+        // Even with no windows, return confirmed tokens if we have them
+        let confirmedAsSynthesized = context.confirmedTokens.map { confirmed in
+            SynthesizedToken(
+                text: confirmed.text,
+                tokenId: confirmed.tokenId,
+                confidence: confirmed.confidence,
+                startTimeMs: confirmed.startTimeMs,
+                durationMs: confirmed.durationMs,
+                sourceWindowIndex: confirmed.sourceWindowIndex,
+                upvotes: confirmed.upvotes,
+                downvotes: confirmed.downvotes,
+                isConfirmed: true,
+                candidates: []
+            )
+        }
+        return SynthesisResult(tokens: confirmedAsSynthesized, newlyConfirmed: [])
     }
+
+    // Find the earliest time covered by current windows
+    let earliestWindowStartMs = context.windows.map(\.startTimeMs).min() ?? 0
+
+    // Convert confirmed tokens that are BEFORE the current window range to synthesized tokens
+    // These are tokens that have "aged out" of the window history but were already confirmed
+    var synthesizedTokens: [SynthesizedToken] = context.confirmedTokens
+        .filter { $0.startTimeMs < earliestWindowStartMs }
+        .map { confirmed in
+            SynthesizedToken(
+                text: confirmed.text,
+                tokenId: confirmed.tokenId,
+                confidence: confirmed.confidence,
+                startTimeMs: confirmed.startTimeMs,
+                durationMs: confirmed.durationMs,
+                sourceWindowIndex: confirmed.sourceWindowIndex,
+                upvotes: confirmed.upvotes,
+                downvotes: confirmed.downvotes,
+                isConfirmed: true,
+                candidates: []
+            )
+        }
 
     // Build position groups - tokens from different windows at the same time position
     let positionGroups = buildPositionGroups(
@@ -324,7 +361,6 @@ public func synthesizeTokens(context: SynthesisContext) -> SynthesisResult {
     )
 
     // Apply strategy to select best token for each position
-    var synthesizedTokens: [SynthesizedToken] = []
     var newlyConfirmed: [SynthesizedToken] = []
 
     for group in positionGroups {
