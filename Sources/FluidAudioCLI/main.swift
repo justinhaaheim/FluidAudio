@@ -20,6 +20,7 @@ func printUsage() {
             asr-benchmark           Run ASR benchmark on LibriSpeech
             fleurs-benchmark        Run multilingual ASR benchmark on FLEURS dataset
             transcribe              Transcribe audio file using streaming ASR
+            live-transcribe         Transcribe live microphone audio in real-time
             multi-stream            Transcribe multiple audio files in parallel
             tts                     Synthesize speech from text using Kokoro TTS
             parakeet-eou            Run Parakeet EOU Streaming ASR on a single file
@@ -40,7 +41,9 @@ func printUsage() {
             fluidaudio transcribe audio.wav --low-latency
 
             fluidaudio multi-stream audio1.wav audio2.wav
-            
+
+            fluidaudio live-transcribe --low-latency
+
             fluidaudio tts "Hello world" --output hello.wav
 
             fluidaudio vad-analyze audio.wav --streaming
@@ -130,6 +133,8 @@ Task {
         await TranscribeCommand.run(arguments: Array(arguments.dropFirst(2)))
     case "multi-stream":
         await MultiStreamCommand.run(arguments: Array(arguments.dropFirst(2)))
+    case "live-transcribe":
+        await LiveTranscribeCommand.run(arguments: Array(arguments.dropFirst(2)))
 
     case "tts":
         await TTS.run(arguments: Array(arguments.dropFirst(2)))
