@@ -36,6 +36,9 @@ public actor SlidingWindowStreamingManager {
     // Decoder state (only used when preserveDecoderState is true)
     private var decoderState: TdtDecoderState?
 
+    // Window history for multi-window synthesis
+    private var windowHistory: WindowHistory?
+
     // Input stream
     private let inputSequence: AsyncStream<AVAudioPCMBuffer>
     private let inputBuilder: AsyncStream<AVAudioPCMBuffer>.Continuation
@@ -116,6 +119,14 @@ public actor SlidingWindowStreamingManager {
             logger.info("Initialized persistent decoder state")
         } else {
             decoderState = nil
+        }
+
+        // Initialize window history for multi-window synthesis
+        if config.enableSynthesis {
+            windowHistory = WindowHistory(maxWindows: config.synthesisMaxWindows)
+            logger.info("Initialized window history for synthesis (max \(config.synthesisMaxWindows) windows)")
+        } else {
+            windowHistory = nil
         }
 
         // Start audio receive task
@@ -362,6 +373,52 @@ public actor SlidingWindowStreamingManager {
                 )
             }
 
+            // Add to window history for synthesis if enabled
+            var synthesisResult: SynthesisResult?
+            if config.enableSynthesis, let windowHistory = windowHistory {
+                let synthesisWindow = buildSynthesisWindowData(
+                    tokenWindows: tokenWindows,
+                    windowIndex: chunkCount - 1,
+                    windowStartSample: absoluteStartSample,
+                    windowDurationSamples: samples.count,
+                    asrManager: asrManager
+                )
+                windowHistory.addWindow(synthesisWindow)
+
+                // Run synthesis across all accumulated windows
+                let context = SynthesisContext(
+                    windows: windowHistory.allWindows(),
+                    confirmedTokens: windowHistory.allConfirmedTokens(),
+                    strategy: config.mergeStrategy,
+                    config: config.synthesisConfig
+                )
+                synthesisResult = synthesizeTokens(context: context)
+
+                // Update confirmed tokens in history
+                if !synthesisResult!.newlyConfirmed.isEmpty {
+                    let confirmedToAdd = synthesisResult!.newlyConfirmed.map { token in
+                        ConfirmedToken(
+                            tokenId: token.tokenId,
+                            text: token.text,
+                            confidence: token.confidence,
+                            startTimeMs: token.startTimeMs,
+                            durationMs: token.durationMs,
+                            sourceWindowIndex: token.sourceWindowIndex,
+                            confirmedAtWindowIndex: chunkCount - 1,
+                            upvotes: token.upvotes,
+                            downvotes: token.downvotes
+                        )
+                    }
+                    windowHistory.addConfirmedTokens(confirmedToAdd)
+                }
+
+                logger.debug(
+                    "Synthesis: \(synthesisResult!.tokens.count) tokens, " +
+                    "\(synthesisResult!.newlyConfirmed.count) newly confirmed, " +
+                    "\(windowHistory.windowCount) windows in history"
+                )
+            }
+
             // Merge with confirmed tokens
             await mergeTokens(tokenWindows, windowStartSample: absoluteStartSample)
 
@@ -370,12 +427,13 @@ public actor SlidingWindowStreamingManager {
                 await updateTranscriptionState(with: chunkResult)
             }
 
-            // Emit update with raw chunk text and optional window data
+            // Emit update with raw chunk text and optional window/synthesis data
             await emitUpdate(
                 isFinal: isFinal,
                 latestChunkText: chunkResult.text,
                 chunkConfidence: chunkResult.confidence,
-                windowData: windowData
+                windowData: windowData,
+                synthesisResult: synthesisResult
             )
 
         } catch {
@@ -526,12 +584,70 @@ public actor SlidingWindowStreamingManager {
         )
     }
 
+    /// Build synthesis window data for multi-window token merging
+    private func buildSynthesisWindowData(
+        tokenWindows: [TokenWindow],
+        windowIndex: Int,
+        windowStartSample: Int,
+        windowDurationSamples: Int,
+        asrManager: AsrManager
+    ) -> SynthesisWindowData {
+        let windowStartMs = (windowStartSample * 1000) / SlidingWindowStreamingConfig.sampleRate
+        let windowDurationMs = (windowDurationSamples * 1000) / SlidingWindowStreamingConfig.sampleRate
+        let edgeBufferMs = config.edgeBufferMs
+
+        // Convert tokens to TokenCandidate format
+        let tokens: [TokenCandidate] = tokenWindows.enumerated().map { idx, tw in
+            // Convert frame timestamp to milliseconds
+            let frameMs = (tw.timestamp * 1000 * ASRConstants.samplesPerEncoderFrame) / SlidingWindowStreamingConfig.sampleRate
+            let absoluteStartMs = windowStartMs + frameMs
+
+            // Estimate duration from token spacing (last token gets remaining duration)
+            let durationMs: Int
+            if idx < tokenWindows.count - 1 {
+                let nextFrameMs = (tokenWindows[idx + 1].timestamp * 1000 * ASRConstants.samplesPerEncoderFrame)
+                    / SlidingWindowStreamingConfig.sampleRate
+                durationMs = nextFrameMs - frameMs
+            } else {
+                durationMs = max(50, windowDurationMs - frameMs)  // At least 50ms for last token
+            }
+
+            // Calculate position ratio (0.0 = start, 1.0 = end)
+            let positionRatio = windowDurationMs > 0 ? Float(frameMs) / Float(windowDurationMs) : 0.0
+
+            // Determine if in edge buffer
+            let isEdgeToken = frameMs < edgeBufferMs || frameMs > (windowDurationMs - edgeBufferMs)
+
+            // Decode token text
+            let tokenText = asrManager.decodeToken(tw.token)
+
+            return TokenCandidate(
+                tokenId: tw.token,
+                text: tokenText,
+                confidence: tw.confidence,
+                startTimeMs: absoluteStartMs,
+                durationMs: durationMs,
+                windowIndex: windowIndex,
+                positionRatio: positionRatio,
+                isEdgeToken: isEdgeToken
+            )
+        }
+
+        return SynthesisWindowData(
+            windowIndex: windowIndex,
+            startTimeMs: windowStartMs,
+            durationMs: windowDurationMs,
+            tokens: tokens
+        )
+    }
+
     /// Emit transcription update with metrics
     private func emitUpdate(
         isFinal: Bool,
         latestChunkText: String = "",
         chunkConfidence: Float = 0,
-        windowData: TranscriptionWindowData? = nil
+        windowData: TranscriptionWindowData? = nil,
+        synthesisResult: SynthesisResult? = nil
     ) async {
         guard let asrManager = asrManager else { return }
 
@@ -564,7 +680,9 @@ public actor SlidingWindowStreamingManager {
             timestamp: Date(),
             tokenTimings: result.tokenTimings ?? [],
             metrics: metrics,
-            windowData: windowData
+            windowData: windowData,
+            synthesizedTokens: synthesisResult?.tokens,
+            synthesisWindowCount: windowHistory?.windowCount
         )
 
         updateContinuation?.yield(update)
@@ -642,6 +760,21 @@ public struct SlidingWindowStreamingConfig: Sendable {
     /// Tokens within this buffer are marked as lower trust.
     public let edgeBufferSeconds: TimeInterval
 
+    // MARK: - Multi-Window Synthesis Options
+
+    /// Whether to enable multi-window token synthesis (default: false)
+    /// When enabled, tokens from multiple overlapping windows are compared and merged.
+    public let enableSynthesis: Bool
+
+    /// Maximum number of windows to keep in synthesis history
+    public let synthesisMaxWindows: Int
+
+    /// Strategy for merging tokens across windows
+    public let mergeStrategy: MergeStrategy
+
+    /// Configuration for the synthesis process
+    public let synthesisConfig: SynthesisConfig
+
     /// Default configuration optimized for quality
     public static let `default` = SlidingWindowStreamingConfig(
         intervalSeconds: 2.0,
@@ -654,7 +787,11 @@ public struct SlidingWindowStreamingConfig: Sendable {
         confirmationThreshold: 0.85,
         minContextForConfirmation: 10.0,
         emitWindowData: false,
-        edgeBufferSeconds: 1.0
+        edgeBufferSeconds: 1.0,
+        enableSynthesis: false,
+        synthesisMaxWindows: 20,
+        mergeStrategy: .latestWindow,
+        synthesisConfig: .default
     )
 
     /// Low-latency configuration for faster updates
@@ -669,7 +806,11 @@ public struct SlidingWindowStreamingConfig: Sendable {
         confirmationThreshold: 0.80,
         minContextForConfirmation: 5.0,
         emitWindowData: false,
-        edgeBufferSeconds: 0.5
+        edgeBufferSeconds: 0.5,
+        enableSynthesis: false,
+        synthesisMaxWindows: 10,
+        mergeStrategy: .latestWindow,
+        synthesisConfig: .default
     )
 
     /// High quality configuration with longer context
@@ -684,7 +825,11 @@ public struct SlidingWindowStreamingConfig: Sendable {
         confirmationThreshold: 0.90,
         minContextForConfirmation: 15.0,
         emitWindowData: false,
-        edgeBufferSeconds: 1.5
+        edgeBufferSeconds: 1.5,
+        enableSynthesis: false,
+        synthesisMaxWindows: 30,
+        mergeStrategy: .latestWindow,
+        synthesisConfig: .default
     )
 
     /// Stateful configuration - preserves decoder state for linguistic continuity
@@ -699,7 +844,11 @@ public struct SlidingWindowStreamingConfig: Sendable {
         confirmationThreshold: 0.85,
         minContextForConfirmation: 10.0,
         emitWindowData: false,
-        edgeBufferSeconds: 1.0
+        edgeBufferSeconds: 1.0,
+        enableSynthesis: false,
+        synthesisMaxWindows: 20,
+        mergeStrategy: .latestWindow,
+        synthesisConfig: .default
     )
 
     /// Debug configuration - emits detailed window data for visualization
@@ -714,7 +863,11 @@ public struct SlidingWindowStreamingConfig: Sendable {
         confirmationThreshold: 0.85,
         minContextForConfirmation: 10.0,
         emitWindowData: true,
-        edgeBufferSeconds: 1.0
+        edgeBufferSeconds: 1.0,
+        enableSynthesis: true,
+        synthesisMaxWindows: 20,
+        mergeStrategy: .weightedComposite(weights: .default),
+        synthesisConfig: .default
     )
 
     public init(
@@ -728,7 +881,11 @@ public struct SlidingWindowStreamingConfig: Sendable {
         confirmationThreshold: Double = 0.85,
         minContextForConfirmation: TimeInterval = 10.0,
         emitWindowData: Bool = false,
-        edgeBufferSeconds: TimeInterval = 1.0
+        edgeBufferSeconds: TimeInterval = 1.0,
+        enableSynthesis: Bool = false,
+        synthesisMaxWindows: Int = 20,
+        mergeStrategy: MergeStrategy = .latestWindow,
+        synthesisConfig: SynthesisConfig = .default
     ) {
         self.intervalSeconds = intervalSeconds
         self.contextWindowSeconds = contextWindowSeconds
@@ -741,6 +898,10 @@ public struct SlidingWindowStreamingConfig: Sendable {
         self.minContextForConfirmation = minContextForConfirmation
         self.emitWindowData = emitWindowData
         self.edgeBufferSeconds = edgeBufferSeconds
+        self.enableSynthesis = enableSynthesis
+        self.synthesisMaxWindows = synthesisMaxWindows
+        self.mergeStrategy = mergeStrategy
+        self.synthesisConfig = synthesisConfig
     }
 
     // Sample counts at 16kHz
@@ -891,6 +1052,12 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
     /// Detailed window token data for visualization (only when emitWindowData is enabled)
     public let windowData: TranscriptionWindowData?
 
+    /// Synthesized tokens from multi-window merging (only when enableSynthesis is true)
+    public let synthesizedTokens: [SynthesizedToken]?
+
+    /// Number of windows in synthesis history
+    public let synthesisWindowCount: Int?
+
     public init(
         text: String,
         volatileTranscript: String = "",
@@ -902,7 +1069,9 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
         timestamp: Date,
         tokenTimings: [TokenTiming],
         metrics: TranscriptionMetrics,
-        windowData: TranscriptionWindowData? = nil
+        windowData: TranscriptionWindowData? = nil,
+        synthesizedTokens: [SynthesizedToken]? = nil,
+        synthesisWindowCount: Int? = nil
     ) {
         self.text = text
         self.volatileTranscript = volatileTranscript
@@ -915,5 +1084,7 @@ public struct SlidingWindowTranscriptionUpdate: Sendable {
         self.tokenTimings = tokenTimings
         self.metrics = metrics
         self.windowData = windowData
+        self.synthesizedTokens = synthesizedTokens
+        self.synthesisWindowCount = synthesisWindowCount
     }
 }
