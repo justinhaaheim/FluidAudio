@@ -39,6 +39,11 @@ public actor SlidingWindowStreamingManager {
     // Window history for multi-window synthesis
     private var windowHistory: WindowHistory?
 
+    // Strategy-based synthesis (new system)
+    private let strategy: any TranscriptionStrategy = LatestWindowStrategy()
+    private var strategyWindows: [TranscriptionWindow] = []
+    private var lastStrategyOutput: StrategyOutput?
+
     // Input stream
     private let inputSequence: AsyncStream<AVAudioPCMBuffer>
     private let inputBuilder: AsyncStream<AVAudioPCMBuffer>.Continuation
@@ -419,6 +424,64 @@ public actor SlidingWindowStreamingManager {
                 )
             }
 
+            // Strategy-based synthesis (new system)
+            if config.enableStrategySystem {
+                // Build TranscriptionWindow from token results
+                let strategyWindow = buildStrategyWindow(
+                    tokenWindows: tokenWindows,
+                    windowIndex: chunkCount - 1,
+                    windowStartSample: absoluteStartSample,
+                    windowDurationSamples: samples.count,
+                    asrManager: asrManager
+                )
+                strategyWindows.append(strategyWindow)
+
+                // Prune old windows (keep last N based on config)
+                let maxWindows = config.synthesisMaxWindows
+                if strategyWindows.count > maxWindows {
+                    strategyWindows.removeFirst(strategyWindows.count - maxWindows)
+                }
+
+                // Calculate latest audio time in milliseconds
+                let latestAudioTimeMs = Int(Double(totalSamplesReceived) / Double(SlidingWindowStreamingConfig.sampleRate) * 1000)
+
+                // Build input and execute strategy
+                let strategyInput = StrategyInput(
+                    windows: strategyWindows,
+                    config: config.strategyConfig,
+                    latestAudioTimeMs: latestAudioTimeMs
+                )
+                let strategyOutput = strategy.execute(strategyInput)
+                lastStrategyOutput = strategyOutput
+
+                // Handle decoder reset decision
+                if strategyOutput.shouldResetDecoder && config.preserveDecoderState {
+                    decoderState = TdtDecoderState.make()
+                    logger.info("Strategy requested decoder reset: \(strategyOutput.resetReason ?? "no reason")")
+                }
+
+                // Log diagnostics
+                for diagnostic in strategyOutput.diagnostics {
+                    switch diagnostic.level {
+                    case .info:
+                        logger.info("Strategy: \(diagnostic.message)")
+                    case .warning:
+                        logger.warning("Strategy: \(diagnostic.message)")
+                    case .error:
+                        logger.error("Strategy: \(diagnostic.message)")
+                    }
+                }
+
+                // Log summary
+                let confirmedCount = strategyOutput.tokens.filter(\.isConfirmed).count
+                let volatileCount = strategyOutput.tokens.count - confirmedCount
+                logger.debug(
+                    "Strategy [\(strategy.name)]: \(strategyOutput.tokens.count) tokens " +
+                    "(\(confirmedCount) confirmed, \(volatileCount) volatile), " +
+                    "\(strategyWindows.count) windows"
+                )
+            }
+
             // Merge with confirmed tokens
             await mergeTokens(tokenWindows, windowStartSample: absoluteStartSample)
 
@@ -641,6 +704,47 @@ public actor SlidingWindowStreamingManager {
         )
     }
 
+    /// Build a TranscriptionWindow for the new strategy system
+    private func buildStrategyWindow(
+        tokenWindows: [TokenWindow],
+        windowIndex: Int,
+        windowStartSample: Int,
+        windowDurationSamples: Int,
+        asrManager: AsrManager
+    ) -> TranscriptionWindow {
+        let windowStartMs = (windowStartSample * 1000) / SlidingWindowStreamingConfig.sampleRate
+        let windowDurationMs = (windowDurationSamples * 1000) / SlidingWindowStreamingConfig.sampleRate
+
+        // Convert tokens to InputToken format
+        let tokens: [InputToken] = tokenWindows.map { tw in
+            // Convert frame timestamp to milliseconds
+            let frameMs = (tw.timestamp * 1000 * ASRConstants.samplesPerEncoderFrame) / SlidingWindowStreamingConfig.sampleRate
+            let absoluteTimestampMs = windowStartMs + frameMs
+
+            // Calculate position ratio (0.0 = start, 1.0 = end)
+            let positionRatio = windowDurationMs > 0 ? Float(frameMs) / Float(windowDurationMs) : 0.0
+
+            // Decode token text
+            let tokenText = asrManager.decodeToken(tw.token)
+
+            return InputToken(
+                tokenId: tw.token,
+                text: tokenText,
+                confidence: tw.confidence,
+                timestampMs: absoluteTimestampMs,
+                positionInWindow: positionRatio
+            )
+        }
+
+        return TranscriptionWindow(
+            windowIndex: windowIndex,
+            startTimeMs: windowStartMs,
+            durationMs: windowDurationMs,
+            tokens: tokens,
+            wasStateful: config.preserveDecoderState && decoderState != nil
+        )
+    }
+
     /// Emit transcription update with metrics
     private func emitUpdate(
         isFinal: Bool,
@@ -775,6 +879,13 @@ public struct SlidingWindowStreamingConfig: Sendable {
     /// Configuration for the synthesis process
     public let synthesisConfig: SynthesisConfig
 
+    /// Whether to enable the new strategy-based synthesis system (default: false)
+    /// When enabled, uses TranscriptionStrategy protocol for token merging decisions.
+    public let enableStrategySystem: Bool
+
+    /// Configuration for the strategy system (used when enableStrategySystem is true)
+    public let strategyConfig: StrategyConfig
+
     /// Default configuration optimized for quality
     public static let `default` = SlidingWindowStreamingConfig(
         intervalSeconds: 2.0,
@@ -791,7 +902,9 @@ public struct SlidingWindowStreamingConfig: Sendable {
         enableSynthesis: false,
         synthesisMaxWindows: 20,
         mergeStrategy: .latestWindow,
-        synthesisConfig: .default
+        synthesisConfig: .default,
+        enableStrategySystem: false,
+        strategyConfig: .default
     )
 
     /// Low-latency configuration for faster updates
@@ -810,7 +923,9 @@ public struct SlidingWindowStreamingConfig: Sendable {
         enableSynthesis: false,
         synthesisMaxWindows: 10,
         mergeStrategy: .latestWindow,
-        synthesisConfig: .default
+        synthesisConfig: .default,
+        enableStrategySystem: false,
+        strategyConfig: .default
     )
 
     /// High quality configuration with longer context
@@ -829,7 +944,9 @@ public struct SlidingWindowStreamingConfig: Sendable {
         enableSynthesis: false,
         synthesisMaxWindows: 30,
         mergeStrategy: .latestWindow,
-        synthesisConfig: .default
+        synthesisConfig: .default,
+        enableStrategySystem: false,
+        strategyConfig: .default
     )
 
     /// Stateful configuration - preserves decoder state for linguistic continuity
@@ -848,7 +965,9 @@ public struct SlidingWindowStreamingConfig: Sendable {
         enableSynthesis: false,
         synthesisMaxWindows: 20,
         mergeStrategy: .latestWindow,
-        synthesisConfig: .default
+        synthesisConfig: .default,
+        enableStrategySystem: false,
+        strategyConfig: .default
     )
 
     /// Debug configuration - emits detailed window data for visualization
@@ -867,7 +986,9 @@ public struct SlidingWindowStreamingConfig: Sendable {
         enableSynthesis: true,
         synthesisMaxWindows: 20,
         mergeStrategy: .weightedComposite(weights: .default),
-        synthesisConfig: .default
+        synthesisConfig: .default,
+        enableStrategySystem: true,
+        strategyConfig: .default
     )
 
     public init(
@@ -885,7 +1006,9 @@ public struct SlidingWindowStreamingConfig: Sendable {
         enableSynthesis: Bool = false,
         synthesisMaxWindows: Int = 20,
         mergeStrategy: MergeStrategy = .latestWindow,
-        synthesisConfig: SynthesisConfig = .default
+        synthesisConfig: SynthesisConfig = .default,
+        enableStrategySystem: Bool = false,
+        strategyConfig: StrategyConfig = .default
     ) {
         self.intervalSeconds = intervalSeconds
         self.contextWindowSeconds = contextWindowSeconds
@@ -902,6 +1025,8 @@ public struct SlidingWindowStreamingConfig: Sendable {
         self.synthesisMaxWindows = synthesisMaxWindows
         self.mergeStrategy = mergeStrategy
         self.synthesisConfig = synthesisConfig
+        self.enableStrategySystem = enableStrategySystem
+        self.strategyConfig = strategyConfig
     }
 
     // Sample counts at 16kHz
