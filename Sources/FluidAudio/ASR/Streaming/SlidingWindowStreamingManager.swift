@@ -496,7 +496,8 @@ public actor SlidingWindowStreamingManager {
                 latestChunkText: chunkResult.text,
                 chunkConfidence: chunkResult.confidence,
                 windowData: windowData,
-                synthesisResult: synthesisResult
+                synthesisResult: synthesisResult,
+                strategyOutput: lastStrategyOutput
             )
 
         } catch {
@@ -751,21 +752,40 @@ public actor SlidingWindowStreamingManager {
         latestChunkText: String = "",
         chunkConfidence: Float = 0,
         windowData: TranscriptionWindowData? = nil,
-        synthesisResult: SynthesisResult? = nil
+        synthesisResult: SynthesisResult? = nil,
+        strategyOutput: StrategyOutput? = nil
     ) async {
         guard let asrManager = asrManager else { return }
 
-        // Convert tokens to text (merged/accumulated)
-        let result = asrManager.processTranscriptionResult(
-            tokenIds: confirmedTokens.map { $0.token },
-            timestamps: confirmedTokens.map { $0.timestamp },
-            confidences: confirmedTokens.map { $0.confidence },
-            encoderSequenceLength: 0,
-            audioSamples: [],
-            processingTime: lastTranscriptionDuration
-        )
-
         let metrics = getMetrics()
+
+        // Determine text based on which system is enabled
+        let text: String
+        let confirmed: String
+        let volatile: String
+        let confidence: Float
+
+        if config.enableStrategySystem, let output = strategyOutput {
+            // Use NEW strategy system output
+            text = output.text
+            confirmed = output.confirmedText
+            volatile = output.volatileText
+            confidence = output.tokens.isEmpty ? 0 : output.tokens.map(\.confidence).reduce(0, +) / Float(output.tokens.count)
+        } else {
+            // Use OLD system output
+            let result = asrManager.processTranscriptionResult(
+                tokenIds: confirmedTokens.map { $0.token },
+                timestamps: confirmedTokens.map { $0.timestamp },
+                confidences: confirmedTokens.map { $0.confidence },
+                encoderSequenceLength: 0,
+                audioSamples: [],
+                processingTime: lastTranscriptionDuration
+            )
+            text = result.text
+            confirmed = confirmedTranscript
+            volatile = volatileTranscript
+            confidence = result.confidence
+        }
 
         // Determine if this chunk should be marked as confirmed
         let totalAudioProcessed = Double(totalSamplesReceived) / Double(SlidingWindowStreamingConfig.sampleRate)
@@ -774,19 +794,19 @@ public actor SlidingWindowStreamingManager {
         let isConfirmed = config.useConfirmationModel && isHighConfidence && hasMinimumContext
 
         let update = SlidingWindowTranscriptionUpdate(
-            text: result.text,
-            volatileTranscript: volatileTranscript,
-            confirmedTranscript: confirmedTranscript,
+            text: text,
+            volatileTranscript: volatile,
+            confirmedTranscript: confirmed,
             isConfirmed: isConfirmed,
             latestChunkText: latestChunkText,
             isFinal: isFinal,
-            confidence: result.confidence,
+            confidence: confidence,
             timestamp: Date(),
-            tokenTimings: result.tokenTimings ?? [],
+            tokenTimings: [],
             metrics: metrics,
             windowData: windowData,
             synthesizedTokens: synthesisResult?.tokens,
-            synthesisWindowCount: windowHistory?.windowCount
+            synthesisWindowCount: config.enableStrategySystem ? strategyWindows.count : windowHistory?.windowCount
         )
 
         updateContinuation?.yield(update)
